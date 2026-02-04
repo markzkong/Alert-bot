@@ -13,6 +13,9 @@ const SLUG_PREFIX = String(
 
 const FORCE_EVENT_SLUG = String(process.env.FORCE_EVENT_SLUG || "").trim();
 
+// NEW: which outcome to track when this is a multi-outcome market
+const OUTCOME_NAME = String(process.env.OUTCOME_NAME || "ChatGPT").trim();
+
 const POLL_SECONDS = Number(process.env.POLL_SECONDS || 60);
 const THRESHOLD_WARN = Number(process.env.THRESHOLD_WARN || 0.9);
 const THRESHOLD_CRIT = Number(process.env.THRESHOLD_CRIT || 0.5);
@@ -139,7 +142,7 @@ async function findCurrentWeeklyEventSlug() {
       if (endMs >= now) score = endMs;
       else score = endMs + 1e15;
     }
-    return { slug: e.slug, score, endMs };
+    return { slug: e.slug, score };
   });
 
   scored.sort((a, b) => a.score - b.score);
@@ -151,37 +154,87 @@ async function getEventBySlug(slug) {
   return await fetchJson(url);
 }
 
-function extractYesTokenId(eventObj) {
+/**
+ * Choose the best market to read from the event.
+ * If there are multiple markets, prefer one that looks like the weekly question.
+ * Otherwise use the first market.
+ */
+function pickMarket(eventObj) {
   const markets = eventObj?.markets;
   if (!Array.isArray(markets) || markets.length === 0) {
     throw new Error("No markets found in event response.");
   }
 
-  const m = markets[0];
+  // Heuristic: prefer market whose question mentions the outcome name, if available.
+  const preferred = markets.find((m) => {
+    const q = String(m?.question || "").toLowerCase();
+    return q.includes(OUTCOME_NAME.toLowerCase());
+  });
 
-  let outcomes = m.outcomes;
-  let tokenIds = m.clobTokenIds;
+  return preferred || markets[0];
+}
+
+/**
+ * Extract token id for:
+ * - YES if market is binary ("Yes"/"No"), else
+ * - OUTCOME_NAME (default "ChatGPT") for multi-outcome markets
+ */
+function extractTrackedTokenIdFromMarket(marketObj) {
+  let outcomes = marketObj.outcomes;
+  let tokenIds = marketObj.clobTokenIds;
 
   if (typeof outcomes === "string") outcomes = JSON.parse(outcomes);
   if (typeof tokenIds === "string") tokenIds = JSON.parse(tokenIds);
 
+  if (!Array.isArray(outcomes) || !Array.isArray(tokenIds) || outcomes.length !== tokenIds.length) {
+    throw new Error("Market outcomes/clobTokenIds missing or malformed.");
+  }
+
+  // Case 1: binary market
   const yesIndex = outcomes.findIndex((o) => String(o).toLowerCase() === "yes");
-  return String(tokenIds[yesIndex]);
+  if (yesIndex >= 0) {
+    const yesTokenId = tokenIds[yesIndex];
+    if (!yesTokenId) throw new Error("YES token id was empty.");
+    return { tokenId: String(yesTokenId), label: "Yes" };
+  }
+
+  // Case 2: multi-outcome market (track ChatGPT outcome)
+  const targetIndex = outcomes.findIndex(
+    (o) => String(o).trim().toLowerCase() === OUTCOME_NAME.toLowerCase()
+  );
+
+  if (targetIndex < 0) {
+    throw new Error(
+      `Could not find outcome "${OUTCOME_NAME}" in outcomes: ${outcomes.slice(0, 15).join(", ")}`
+    );
+  }
+
+  const tokenId = tokenIds[targetIndex];
+  if (!tokenId) throw new Error(`Token id for outcome "${OUTCOME_NAME}" was empty.`);
+  return { tokenId: String(tokenId), label: OUTCOME_NAME };
 }
 
-async function getYesProbability(tokenId) {
+async function getProbabilityFromTokenId(tokenId) {
   try {
     const midUrl = `${CLOB_BASE}/midpoint?token_id=${encodeURIComponent(tokenId)}`;
     const mid = await fetchJson(midUrl);
     const p = Number(mid?.midpoint);
     if (Number.isFinite(p)) return p;
-  } catch {}
+  } catch {
+    // fallback
+  }
 
   const buyUrl = `${CLOB_BASE}/price?token_id=${encodeURIComponent(tokenId)}&side=BUY`;
   const sellUrl = `${CLOB_BASE}/price?token_id=${encodeURIComponent(tokenId)}&side=SELL`;
 
   const [buy, sell] = await Promise.all([fetchJson(buyUrl), fetchJson(sellUrl)]);
-  return (Number(buy.price) + Number(sell.price)) / 2;
+  const pb = Number(buy?.price);
+  const ps = Number(sell?.price);
+
+  if (!Number.isFinite(pb) || !Number.isFinite(ps)) {
+    throw new Error("Could not read buy/sell price as numbers.");
+  }
+  return (pb + ps) / 2;
 }
 
 function fmtPct(x) {
@@ -208,7 +261,9 @@ function updateTriggers(state, prob) {
 async function mainLoop() {
   let state = await loadState();
 
-  console.log(`[${nowIso()}] Starting monitor. SLUG_PREFIX=${SLUG_PREFIX}`);
+  console.log(
+    `[${nowIso()}] Starting monitor. SLUG_PREFIX=${SLUG_PREFIX} FORCE_EVENT_SLUG=${FORCE_EVENT_SLUG || "(none)"} OUTCOME_NAME=${OUTCOME_NAME}`
+  );
 
   while (true) {
     try {
@@ -222,41 +277,59 @@ async function mainLoop() {
 
       if (state.trackedSlug !== currentSlug) {
         state.trackedSlug = currentSlug;
+        state.lastProb = null;
         state.warnTriggered = false;
         state.critTriggered = false;
         await saveState(state);
 
         await sendTelegram(
-          `Tracking weekly event:\n${makeEventUrl(currentSlug)}`
+          `Tracking weekly event:\n${makeEventUrl(currentSlug)}\nTracking outcome: ${OUTCOME_NAME}`
         );
       }
 
       const ev = await getEventBySlug(state.trackedSlug);
-      const yesTokenId = extractYesTokenId(ev);
-      const prob = await getYesProbability(yesTokenId);
+      const market = pickMarket(ev);
+      const { tokenId, label } = extractTrackedTokenIdFromMarket(market);
+      const prob = await getProbabilityFromTokenId(tokenId);
+
+      state.lastProb = prob;
 
       const { shouldWarn, shouldCrit } = updateTriggers(state, prob);
       await saveState(state);
 
-      console.log(`[${nowIso()}] prob=${fmtPct(prob)}`);
+      console.log(`[${nowIso()}] ${label} prob=${fmtPct(prob)}`);
 
       if (shouldWarn) {
-        await sendTelegram(`⚠️ Dropped below ${fmtPct(THRESHOLD_WARN)}: ${fmtPct(prob)}`);
+        await sendTelegram(
+          `⚠️ ${label} dropped below ${fmtPct(THRESHOLD_WARN)}: now ${fmtPct(prob)}\n${makeEventUrl(state.trackedSlug)}`
+        );
       }
       if (shouldCrit) {
-        await sendTelegram(`🚨 Dropped below ${fmtPct(THRESHOLD_CRIT)}: ${fmtPct(prob)}`);
+        await sendTelegram(
+          `🚨 ${label} dropped below ${fmtPct(THRESHOLD_CRIT)}: now ${fmtPct(prob)}\n${makeEventUrl(state.trackedSlug)}`
+        );
       }
     } catch (err) {
-      console.error(`[${nowIso()}] Error:`, err.message);
+      console.error(`[${nowIso()}] Error:`, err?.message || err);
     }
 
     await sleep(POLL_SECONDS * 1000);
   }
 }
 
-http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end("running");
-}).listen(PORT);
+http
+  .createServer((req, res) => {
+    if (req.url === "/healthz") {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("ok");
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("running");
+  })
+  .listen(PORT, () => console.log(`[${nowIso()}] HTTP server listening on :${PORT}`));
 
-mainLoop();
+mainLoop().catch((e) => {
+  console.error(`[${nowIso()}] Fatal:`, e);
+  process.exit(1);
+});
