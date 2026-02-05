@@ -10,7 +10,7 @@
  * - POLL_SECONDS (default: 60)
  * - THRESHOLD_WARN (default: 0.90)
  * - THRESHOLD_CRIT (default: 0.50)
- * - LOOKAHEAD_DAYS (default: 10)     // buffer window to find newly created next-week markets
+ * - LOOKAHEAD_DAYS (default: 10)     // window to find newly created next-week markets
  * - SLUG_SCAN_SECONDS (default: 600) // how often to scan Gamma for a new weekly market (10 minutes)
  * - PORT (default: 10000)
  *
@@ -91,7 +91,7 @@ async function saveState(state) {
 }
 
 async function sendTelegram(text) {
-  // Important: Do not encode the bot token in the URL path.
+  // Do not encode the bot token in the URL path.
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
 
   const payload = {
@@ -131,12 +131,10 @@ function slugForDate(d) {
 }
 
 /**
- * ROBUST weekly event detection:
+ * Robust weekly event detection (low load: one /events call per scan):
  * - If FORCE_EVENT_SLUG is set, it always returns that.
- * - Otherwise, it scans Gamma /events once (sorted by createdAt desc) and finds the newest
- *   matching “#1 Free App…” event within the LOOKAHEAD_DAYS window.
- *
- * Low load: one API call per scan.
+ * - Otherwise, it scans Gamma /events and finds the newest matching “#1 Free App…” event
+ *   within the LOOKAHEAD_DAYS window.
  */
 async function findWeeklySlugAuto() {
   if (FORCE_EVENT_SLUG) return FORCE_EVENT_SLUG;
@@ -182,7 +180,7 @@ async function findWeeklySlugAuto() {
     }
   }
 
-  // Fallback: old slug guessing as a backup net.
+  // Fallback: old slug guessing.
   const candidates = [];
   for (let i = 0; i <= LOOKAHEAD_DAYS; i++) {
     const d = new Date(now);
@@ -230,11 +228,29 @@ function parseArrayMaybeJson(x) {
   return null;
 }
 
+function norm(s) {
+  return String(s || "").trim().toLowerCase();
+}
+
+function marketTextBlob(m) {
+  // Gamma objects vary; check a few common fields.
+  return [
+    m?.title,
+    m?.question,
+    m?.description,
+    m?.marketTitle,
+    m?.marketQuestion,
+  ]
+    .map((x) => String(x || ""))
+    .join(" ")
+    .toLowerCase();
+}
+
 /**
- * IMPORTANT FIX:
- * Only choose a market that contains OUTCOME_NAME (ChatGPT).
- * Do not fall back to binary YES/NO markets or the first market, because that
- * causes tracking the wrong token (for example a "Yes" token at 0.7%).
+ * Market selection:
+ * - If there is a true multi-outcome market with OUTCOME_NAME in outcomes, use it.
+ * - Otherwise, this event is likely “per-outcome binary markets”.
+ *   In that case, choose the binary market whose title/question contains OUTCOME_NAME.
  */
 function pickMarket(eventObj) {
   const markets = eventObj?.markets;
@@ -242,23 +258,35 @@ function pickMarket(eventObj) {
     throw new Error("No markets found in event response.");
   }
 
-  const target = OUTCOME_NAME.trim().toLowerCase();
+  const target = norm(OUTCOME_NAME);
 
-  function marketHasOutcome(m, wantedLower) {
+  // 1) True multi-outcome market (outcomes contain ChatGPT, Gemini, etc.)
+  for (const m of markets) {
     const outcomes = parseArrayMaybeJson(m?.outcomes);
-    if (!outcomes) return false;
-    return outcomes.some((o) => String(o).trim().toLowerCase() === wantedLower);
+    if (!outcomes) continue;
+    const hasTarget = outcomes.some((o) => norm(o) === target);
+    if (hasTarget) return m;
   }
 
-  const byOutcome = markets.find((m) => marketHasOutcome(m, target));
-  if (byOutcome) return byOutcome;
+  // 2) Per-outcome binary markets (each market is Yes/No, but question/title includes ChatGPT)
+  const byText = markets.find((m) => marketTextBlob(m).includes(target));
+  if (byText) return byText;
 
-  throw new Error(`Could not find market containing outcome "${OUTCOME_NAME}".`);
+  // Debug hint: show a small sample of market titles/questions in logs.
+  const sample = markets
+    .slice(0, 8)
+    .map((m) => String(m?.title || m?.question || "").slice(0, 80))
+    .filter(Boolean);
+
+  throw new Error(
+    `Could not find a market for "${OUTCOME_NAME}". Sample market labels: ${sample.join(" | ")}`
+  );
 }
 
 /**
  * Extract token id:
- * - Track OUTCOME_NAME for multi-outcome markets.
+ * - If market has "Yes", treat as binary and track Yes (but label it as OUTCOME_NAME).
+ * - Otherwise, track OUTCOME_NAME for true multi-outcome markets.
  */
 function extractTokenId(marketObj) {
   const outcomes = parseArrayMaybeJson(marketObj?.outcomes);
@@ -268,8 +296,16 @@ function extractTokenId(marketObj) {
     throw new Error("Market outcomes/clobTokenIds missing or malformed.");
   }
 
-  const target = OUTCOME_NAME.trim().toLowerCase();
-  const idx = outcomes.findIndex((o) => String(o).trim().toLowerCase() === target);
+  const yesIndex = outcomes.findIndex((o) => norm(o) === "yes");
+  if (yesIndex >= 0) {
+    const tok = tokenIds[yesIndex];
+    if (!tok) throw new Error("YES token id was empty.");
+    // Label as OUTCOME_NAME so alerts read “ChatGPT dropped…”
+    return { tokenId: String(tok), label: OUTCOME_NAME };
+  }
+
+  const target = norm(OUTCOME_NAME);
+  const idx = outcomes.findIndex((o) => norm(o) === target);
   if (idx < 0) {
     throw new Error(
       `Outcome "${OUTCOME_NAME}" not found. Outcomes sample: ${outcomes.slice(0, 20).join(", ")}`
@@ -334,7 +370,6 @@ async function mainLoop() {
     `[${nowIso()}] Starting. FORCE_EVENT_SLUG=${FORCE_EVENT_SLUG || "(none)"} OUTCOME_NAME=${OUTCOME_NAME} POLL_SECONDS=${POLL_SECONDS} LOOKAHEAD_DAYS=${LOOKAHEAD_DAYS} SLUG_SCAN_SECONDS=${SLUG_SCAN_SECONDS}`
   );
 
-  // Throttle weekly-market scanning so it does not run every poll.
   let nextSlugScanAt = 0;
 
   while (true) {
@@ -356,7 +391,6 @@ async function mainLoop() {
         }
       }
 
-      // New week detected
       if (state.trackedSlug !== slug) {
         state.trackedSlug = slug;
         state.warnTriggered = false;
@@ -370,6 +404,11 @@ async function mainLoop() {
 
       const ev = await getEventBySlug(state.trackedSlug);
       const market = pickMarket(ev);
+
+      // Helpful log line: shows which market text was chosen.
+      const chosenLabel = String(market?.title || market?.question || "").slice(0, 140);
+      console.log(`[${nowIso()}] Picked market: ${chosenLabel}`);
+
       const { tokenId, label } = extractTokenId(market);
 
       const prob = await getProbability(tokenId);
