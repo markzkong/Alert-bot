@@ -10,7 +10,7 @@
  * - POLL_SECONDS (default: 60)
  * - THRESHOLD_WARN (default: 0.90)
  * - THRESHOLD_CRIT (default: 0.50)
- * - LOOKAHEAD_DAYS (default: 10)  // buffer window to find newly created next-week markets
+ * - LOOKAHEAD_DAYS (default: 10)     // buffer window to find newly created next-week markets
  * - SLUG_SCAN_SECONDS (default: 600) // how often to scan Gamma for a new weekly market (10 minutes)
  * - PORT (default: 10000)
  *
@@ -91,7 +91,7 @@ async function saveState(state) {
 }
 
 async function sendTelegram(text) {
-  // CHANGE #1: Do not encode the bot token in the URL path.
+  // Important: Do not encode the bot token in the URL path.
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
 
   const payload = {
@@ -131,13 +131,12 @@ function slugForDate(d) {
 }
 
 /**
- * ROBUST weekly event detection (replaces slug probing):
+ * ROBUST weekly event detection:
  * - If FORCE_EVENT_SLUG is set, it always returns that.
  * - Otherwise, it scans Gamma /events once (sorted by createdAt desc) and finds the newest
  *   matching “#1 Free App…” event within the LOOKAHEAD_DAYS window.
  *
- * This is both more reliable (slug format changes do not break it) and far lower load
- * (one API call per scan rather than many slug probes).
+ * Low load: one API call per scan.
  */
 async function findWeeklySlugAuto() {
   if (FORCE_EVENT_SLUG) return FORCE_EVENT_SLUG;
@@ -150,8 +149,6 @@ async function findWeeklySlugAuto() {
   const lookaheadMs = LOOKAHEAD_DAYS * 24 * 60 * 60 * 1000;
   const maxEndMs = nowMs + lookaheadMs;
 
-  // Pull recent active events, newest first.
-  // Gamma supports pagination and ordering via query params.
   const url =
     `${GAMMA_BASE}/events` +
     `?active=true&closed=false&limit=200&order=createdAt&ascending=false`;
@@ -159,7 +156,6 @@ async function findWeeklySlugAuto() {
   const events = await fetchJson(url);
   if (!Array.isArray(events) || events.length === 0) return null;
 
-  // Find the newest created matching event whose endDate is within lookahead and still in the future.
   for (const ev of events) {
     const slug = String(ev?.slug || "").trim();
     const title = String(ev?.title || "").trim().toLowerCase();
@@ -170,27 +166,23 @@ async function findWeeklySlugAuto() {
 
     if (!isMatch) continue;
 
-    // Require a valid endDate window (future and within lookahead)
     const endDateStr = ev?.endDate;
     const endMs = endDateStr ? Date.parse(endDateStr) : NaN;
     if (!Number.isFinite(endMs)) continue;
     if (endMs <= nowMs) continue;
     if (endMs > maxEndMs) continue;
 
-    // Confirm it is a real event by ensuring slug exists and is fetchable.
-    // (Prevents false positives from partial objects.)
     if (!slug) continue;
 
     try {
       const full = await getEventBySlug(slug);
       if (full && full.slug) return slug;
     } catch {
-      // If it fails to fetch, skip it.
+      // skip
     }
   }
 
-  // Fallback: old slug guessing as a backup net (low probability of use, but safe).
-  // This keeps your original behavior available if the list endpoint ever fails.
+  // Fallback: old slug guessing as a backup net.
   const candidates = [];
   for (let i = 0; i <= LOOKAHEAD_DAYS; i++) {
     const d = new Date(now);
@@ -239,8 +231,10 @@ function parseArrayMaybeJson(x) {
 }
 
 /**
- * Prefer the market that actually contains the tracked outcome in its outcomes list.
- * This is more reliable than using the question text.
+ * IMPORTANT FIX:
+ * Only choose a market that contains OUTCOME_NAME (ChatGPT).
+ * Do not fall back to binary YES/NO markets or the first market, because that
+ * causes tracking the wrong token (for example a "Yes" token at 0.7%).
  */
 function pickMarket(eventObj) {
   const markets = eventObj?.markets;
@@ -256,22 +250,15 @@ function pickMarket(eventObj) {
     return outcomes.some((o) => String(o).trim().toLowerCase() === wantedLower);
   }
 
-  // First: a market that contains OUTCOME_NAME
   const byOutcome = markets.find((m) => marketHasOutcome(m, target));
   if (byOutcome) return byOutcome;
 
-  // Second: a binary Yes/No market
-  const byYes = markets.find((m) => marketHasOutcome(m, "yes"));
-  if (byYes) return byYes;
-
-  // Fallback: first market
-  return markets[0];
+  throw new Error(`Could not find market containing outcome "${OUTCOME_NAME}".`);
 }
 
 /**
  * Extract token id:
- * - If market has "Yes", treat as binary and track Yes.
- * - Otherwise track OUTCOME_NAME for multi-outcome markets.
+ * - Track OUTCOME_NAME for multi-outcome markets.
  */
 function extractTokenId(marketObj) {
   const outcomes = parseArrayMaybeJson(marketObj?.outcomes);
@@ -279,13 +266,6 @@ function extractTokenId(marketObj) {
 
   if (!outcomes || !tokenIds || outcomes.length !== tokenIds.length) {
     throw new Error("Market outcomes/clobTokenIds missing or malformed.");
-  }
-
-  const yesIndex = outcomes.findIndex((o) => String(o).trim().toLowerCase() === "yes");
-  if (yesIndex >= 0) {
-    const tok = tokenIds[yesIndex];
-    if (!tok) throw new Error("YES token id was empty.");
-    return { tokenId: String(tok), label: "Yes" };
   }
 
   const target = OUTCOME_NAME.trim().toLowerCase();
@@ -304,7 +284,7 @@ function extractTokenId(marketObj) {
 /**
  * Get live probability:
  * - Prefer midpoint
- * - Fall back to average of BUY/SELL
+ * - Fall back to average of buy/sell
  */
 async function getProbability(tokenId) {
   try {
@@ -315,7 +295,6 @@ async function getProbability(tokenId) {
     // fall back
   }
 
-  // CHANGE #2: Use lowercase side=buy and side=sell.
   const buyUrl = `${CLOB_BASE}/price?token_id=${encodeURIComponent(tokenId)}&side=buy`;
   const sellUrl = `${CLOB_BASE}/price?token_id=${encodeURIComponent(tokenId)}&side=sell`;
 
@@ -355,7 +334,7 @@ async function mainLoop() {
     `[${nowIso()}] Starting. FORCE_EVENT_SLUG=${FORCE_EVENT_SLUG || "(none)"} OUTCOME_NAME=${OUTCOME_NAME} POLL_SECONDS=${POLL_SECONDS} LOOKAHEAD_DAYS=${LOOKAHEAD_DAYS} SLUG_SCAN_SECONDS=${SLUG_SCAN_SECONDS}`
   );
 
-  // CHANGE #3: Throttle weekly-market scanning so it does not run every poll.
+  // Throttle weekly-market scanning so it does not run every poll.
   let nextSlugScanAt = 0;
 
   while (true) {
